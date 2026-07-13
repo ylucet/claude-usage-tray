@@ -16,10 +16,15 @@ Add-Type -MemberDefinition @'
 '@ -Name NativeMethods -Namespace Win32 -ErrorAction SilentlyContinue
 
 $CredFile       = Join-Path $env:USERPROFILE ".claude\.credentials.json"
+$ClaudeConfigFile = Join-Path $env:USERPROFILE ".claude.json"
 $HistoryFile    = Join-Path $env:USERPROFILE ".claude\claude-usage-history.json"
 $ClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 $HistoryMaxDays = 30
 $CooldownSec    = 30
+
+$SettingsFile          = Join-Path $env:USERPROFILE ".claude\tray-settings.json"
+$DefaultRefreshMinutes = 5
+$RefreshRatePresets    = @(1,2,5,10,15,30,60)   # minuti
 
 $script:LastGoodStats    = $null
 $script:LastCallTime     = [datetime]::MinValue
@@ -29,6 +34,7 @@ $script:notified85       = $false
 $script:notified90       = $false
 $script:lastIconPeak     = $false
 $script:lastSessResetsAt = ""
+$script:refreshIntervalMinutes = $DefaultRefreshMinutes
 $SessionEventFile        = Join-Path $PSScriptRoot "session-event.json"
 
 # ─── Utilità ──────────────────────────────────────────────────────────────────
@@ -45,6 +51,37 @@ function Read-JsonFile($path) {
 }
 function Write-JsonFile($path, $obj) {
     [System.IO.File]::WriteAllText($path, ($obj | ConvertTo-Json -Depth 10), [System.Text.Encoding]::UTF8)
+}
+function Get-AccountEmail {
+    # Nota: ~/.claude.json puo' contenere chiavi "projects" duplicate a meno di
+    # maiuscole/minuscole (es. C:/Users/x vs C:/users/x), che mandano in errore
+    # ConvertFrom-Json (dizionario case-insensitive). Si estrae il campo con una
+    # regex mirata invece di fare il parse completo del file.
+    try {
+        $raw = Get-Content $ClaudeConfigFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if (-not $raw) { return $null }
+        if ($raw -match '"emailAddress"\s*:\s*"([^"]*)"') {
+            return $Matches[1]
+        }
+    } catch {}
+    return $null
+}
+function Load-Settings {
+    $s = $null
+    try { $s = Read-JsonFile $SettingsFile } catch { $s = $null }
+    $mins = $DefaultRefreshMinutes
+    if ($s -and $s.refreshRateMinutes) {
+        $candidate = [int]$s.refreshRateMinutes
+        if ($candidate -gt 0) { $mins = $candidate }
+    }
+    $script:refreshIntervalMinutes = $mins
+}
+function Save-Settings {
+    try {
+        Write-JsonFile $SettingsFile ([pscustomobject]@{ refreshRateMinutes = $script:refreshIntervalMinutes })
+    } catch {
+        "$([datetime]::Now) Save-Settings ERRORE: $_" | Out-File $LogFile -Append -Encoding UTF8
+    }
 }
 function Fmt-Tokens([long]$n) {
     if ($n -ge 1000000) { return "$([math]::Round($n/1000000,2))M" }
@@ -763,7 +800,9 @@ function Build-Menu($stats) {
     }
     function Add-Sep() { $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null }
 
-    Add-Label "  Claude Code  /usage" $true
+    $email = Get-AccountEmail
+    $headerText = if ($email) { "  Claude usage: $email" } else { "  Claude usage" }
+    Add-Label $headerText $true
     Add-Sep
     if ($stats.Error) {
         Add-Label "  $($stats.Error)"
@@ -832,6 +871,23 @@ function Build-Menu($stats) {
     $menu.Items.Add($miHistory) | Out-Null
     $miRefresh = New-Object System.Windows.Forms.ToolStripMenuItem; $miRefresh.Text = "  Refresh now"
     $menu.Items.Add($miRefresh) | Out-Null
+    $miRate = New-Object System.Windows.Forms.ToolStripMenuItem; $miRate.Text = "  Refresh rate"
+    foreach ($m in $RefreshRatePresets) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+        $mi.Text    = "  $m min"
+        $mi.Checked = ($m -eq $script:refreshIntervalMinutes)
+        $mi.Tag     = $m
+        $mi.add_Click({
+            param($sndr,$e)
+            foreach ($sibling in $sndr.OwnerItem.DropDownItems) { $sibling.Checked = $false }
+            $sndr.Checked = $true
+            $script:refreshIntervalMinutes = [int]$sndr.Tag
+            $script:refreshTimer.Interval  = [int]$sndr.Tag * 60000
+            Save-Settings
+        })
+        $miRate.DropDownItems.Add($mi) | Out-Null
+    }
+    $menu.Items.Add($miRate) | Out-Null
     $miExit = New-Object System.Windows.Forms.ToolStripMenuItem; $miExit.Text = "  Exit"
     $menu.Items.Add($miExit) | Out-Null
     return [pscustomobject]@{ Menu=$menu; History=$miHistory; Refresh=$miRefresh; Exit=$miExit }
@@ -876,6 +932,8 @@ function New-TrayIcon([double]$pctSess=0,[double]$pctWeek=0,[bool]$isPeak=$false
 
 # ─── Init ─────────────────────────────────────────────────────────────────────
 try {
+
+Load-Settings
 
 $tray      = New-Object System.Windows.Forms.NotifyIcon
 $tray.Icon = New-TrayIcon
@@ -1003,9 +1061,9 @@ $tray.add_MouseClick({
     }
 })
 
-# Auto-refresh ogni 5 minuti
+# Auto-refresh (intervallo configurabile da "Refresh rate")
 $script:refreshTimer = New-Object System.Windows.Forms.Timer
-$script:refreshTimer.Interval = 300000
+$script:refreshTimer.Interval = $script:refreshIntervalMinutes * 60000
 $script:refreshTimer.add_Tick({ & $script:DoRefresh })
 $script:refreshTimer.Start()
 
