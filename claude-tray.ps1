@@ -832,8 +832,17 @@ function Get-PreviousSessionRate([datetime]$beforeTime) {
 }
 
 # ─── Menu contestuale ─────────────────────────────────────────────────────────
-function Build-Menu($stats) {
-    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+# $existingMenu: se passato, ripopola quel ContextMenuStrip invece di crearne uno
+# nuovo (usato per aggiornare i dati mentre il menu e' aperto/pinnato).
+function Build-Menu($stats, $existingMenu = $null) {
+    $isNewMenu = ($null -eq $existingMenu)
+    if ($isNewMenu) {
+        $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    } else {
+        $menu = $existingMenu
+        $menu.SuspendLayout()
+        $menu.Items.Clear()
+    }
     function Add-Label($text,[bool]$bold=$false) {
         $item = New-Object System.Windows.Forms.ToolStripMenuItem
         $item.Text = $text; $item.Enabled = $false
@@ -860,22 +869,24 @@ function Build-Menu($stats) {
     })
     $menu.Items.Add($miPin) | Out-Null
 
-    $menu.add_ItemClicked({
-        param($sndr,$e)
-        $script:lastMenuClickedName = $e.ClickedItem.Name
-    })
-    $menu.add_Closing({
-        param($sndr,$e)
-        if ($e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked -and $script:lastMenuClickedName -eq "PinMenuItem") {
-            $e.Cancel = $true
-            return
-        }
-        if ($script:menuPinned -and (
-                $e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::AppClicked -or
-                $e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::AppFocusChange)) {
-            $e.Cancel = $true
-        }
-    })
+    if ($isNewMenu) {
+        $menu.add_ItemClicked({
+            param($sndr,$e)
+            $script:lastMenuClickedName = $e.ClickedItem.Name
+        })
+        $menu.add_Closing({
+            param($sndr,$e)
+            if ($e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked -and $script:lastMenuClickedName -eq "PinMenuItem") {
+                $e.Cancel = $true
+                return
+            }
+            if ($script:menuPinned -and (
+                    $e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::AppClicked -or
+                    $e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::AppFocusChange)) {
+                $e.Cancel = $true
+            }
+        })
+    }
 
     Add-Sep
     if ($stats.Error) {
@@ -988,6 +999,7 @@ function Build-Menu($stats) {
     $menu.Items.Add($miRate) | Out-Null
     $miExit = New-Object System.Windows.Forms.ToolStripMenuItem; $miExit.Text = "  Exit"
     $menu.Items.Add($miExit) | Out-Null
+    if (-not $isNewMenu) { $menu.ResumeLayout() }
     return [pscustomobject]@{ Menu=$menu; History=$miHistory; Refresh=$miRefresh; Exit=$miExit }
 }
 
@@ -1116,6 +1128,14 @@ $script:DoRefresh = {
     try {
         $script:stats = Get-UsageStats
         Update-Tray
+        # Se il menu e' aperto (es. pinnato), ripopola i suoi contenuti sul posto
+        # cosi' i dati mostrati non restano bloccati al momento dell'apertura.
+        if ($script:menuObj -and $script:menuObj.Menu.Visible) {
+            $script:menuObj = Build-Menu $script:stats $script:menuObj.Menu
+            $script:menuObj.History.add_Click($script:DoShowHistory)
+            $script:menuObj.Refresh.add_Click($script:DoRefresh)
+            $script:menuObj.Exit.add_Click($script:DoExit)
+        }
     } catch {
         "$([datetime]::Now) DoRefresh ERRORE: $_" | Out-File $LogFile -Append -Encoding UTF8
     }
