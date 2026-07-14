@@ -788,6 +788,46 @@ function Draw-Bar([double]$pct, [int]$width = 18) {
     return "[" + ("=" * $filled) + (" " * ($width-$filled)) + "]"
 }
 
+# ─── Velocità sessione precedente (fallback quando la sessione corrente non ha ancora dati) ──
+function Get-PreviousSessionRate([datetime]$beforeTime) {
+    try {
+        if (-not (Test-Path $HistoryFile)) { return $null }
+        $raw = Read-JsonFile $HistoryFile
+        if (-not $raw) { return $null }
+        $pts = @()
+        foreach ($h in @($raw)) {
+            if ($null -eq $h.sess) { continue }
+            $dt = Parse-IsoDate $h.ts
+            if (-not $dt -or $dt -ge $beforeTime) { continue }
+            $pts += [pscustomobject]@{ dt = $dt; sess = [double]$h.sess }
+        }
+        $pts = @($pts | Sort-Object dt)
+        if ($pts.Count -lt 2) { return $null }
+        # Segmenta in "run" per sessione: una nuova run inizia quando il valore
+        # crolla (reset di finestra) o quando c'e' un buco temporale troppo grande.
+        $runs = @(); $cur = @($pts[0])
+        for ($i = 1; $i -lt $pts.Count; $i++) {
+            $prev = $pts[$i-1]; $p = $pts[$i]
+            $gapMin = ($p.dt - $prev.dt).TotalMinutes
+            if ($p.sess -lt ($prev.sess - 5) -or $gapMin -gt 360) {
+                $runs += ,$cur
+                $cur = @($p)
+            } else {
+                $cur += $p
+            }
+        }
+        $runs += ,$cur
+        $lastRun = $runs[-1]
+        if ($lastRun.Count -lt 2) { return $null }
+        $first = $lastRun[0]; $last = $lastRun[-1]
+        $elapsedMin = ($last.dt - $first.dt).TotalMinutes
+        if ($elapsedMin -le 0) { return $null }
+        $rate = ($last.sess - $first.sess) / $elapsedMin
+        if ($rate -le 0) { return $null }
+        return $rate
+    } catch { return $null }
+}
+
 # ─── Menu contestuale ─────────────────────────────────────────────────────────
 function Build-Menu($stats) {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -810,10 +850,31 @@ function Build-Menu($stats) {
         if ($null -ne $stats.Session.Utilization) {
             $pct = $stats.Session.Utilization; $rst = $stats.Session.ResetsAt
             $mins = if ($rst) { [math]::Round(($rst-(Get-Date)).TotalMinutes) } else { 0 }
-            $rstStr = if (-not $rst) { "?" } elseif ($mins -le 0) { "now" } elseif ($mins -lt 60) { "in ${mins}min" } else { "in $([math]::Floor($mins/60))h $($mins%60)min" }
+            $relPart = if ($mins -le 0) { "now" } elseif ($mins -lt 60) { "in ${mins}min" } else { "in $([math]::Floor($mins/60))h $($mins%60)min" }
+            $rstStr = if (-not $rst) { "?" } else { $rst.ToString("ddd HH:mm") + "  ($relPart)" }
             Add-Label "  Current session (5h)" $true
             Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
             Add-Label "  Resets: $rstStr"
+            if ($rst) {
+                $sessionStart = $rst.AddHours(-5)
+                $elapsedMin   = ((Get-Date) - $sessionStart).TotalMinutes
+                $remainMin    = ($rst - (Get-Date)).TotalMinutes
+                $rate = if ($elapsedMin -ge 2 -and $pct -gt 0) { $pct / $elapsedMin } else { Get-PreviousSessionRate $sessionStart }
+                if ($rate -and $rate -gt 0 -and $remainMin -gt 0) {
+                    $minutesToFull = ([math]::Max(0,100 - $pct)) / $rate
+                    if ($minutesToFull -le $remainMin) {
+                        $projTime = (Get-Date).AddMinutes($minutesToFull)
+                        $paceStr  = "100% at " + $projTime.ToString("HH:mm")
+                    } else {
+                        $pctAtReset = $pct + $rate * $remainMin
+                        $leftPct    = [math]::Max(0,[math]::Round(100 - $pctAtReset))
+                        $paceStr    = "~${leftPct}% left at reset"
+                    }
+                } else {
+                    $paceStr = "--  (insufficient data)"
+                }
+                Add-Label "  On pace: $paceStr"
+            }
         }
         Add-Sep
         if ($null -ne $stats.Week.Utilization) {
