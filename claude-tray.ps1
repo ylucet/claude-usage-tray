@@ -35,6 +35,8 @@ $script:notified90       = $false
 $script:lastIconPeak     = $false
 $script:lastSessResetsAt = ""
 $script:refreshIntervalMinutes = $DefaultRefreshMinutes
+$script:menuPinned       = $false
+$script:lastMenuClickedName = $null
 $SessionEventFile        = Join-Path $PSScriptRoot "session-event.json"
 
 # ─── Utilità ──────────────────────────────────────────────────────────────────
@@ -75,10 +77,11 @@ function Load-Settings {
         if ($candidate -gt 0) { $mins = $candidate }
     }
     $script:refreshIntervalMinutes = $mins
+    $script:menuPinned = if ($s -and $null -ne $s.menuPinned) { [bool]$s.menuPinned } else { $false }
 }
 function Save-Settings {
     try {
-        Write-JsonFile $SettingsFile ([pscustomobject]@{ refreshRateMinutes = $script:refreshIntervalMinutes })
+        Write-JsonFile $SettingsFile ([pscustomobject]@{ refreshRateMinutes = $script:refreshIntervalMinutes; menuPinned = $script:menuPinned })
     } catch {
         "$([datetime]::Now) Save-Settings ERRORE: $_" | Out-File $LogFile -Append -Encoding UTF8
     }
@@ -843,6 +846,37 @@ function Build-Menu($stats) {
     $email = Get-AccountEmail
     $headerText = if ($email) { "  Claude usage: $email" } else { "  Claude usage" }
     Add-Label $headerText $true
+
+    $miPin = New-Object System.Windows.Forms.ToolStripMenuItem
+    $miPin.Name = "PinMenuItem"
+    $miPin.Text = if ($script:menuPinned) { "  Pinned (click to unpin)" } else { "  Pin menu (keep open)" }
+    $miPin.CheckOnClick = $true
+    $miPin.Checked = $script:menuPinned
+    $miPin.add_Click({
+        param($sndr,$e)
+        $script:menuPinned = $sndr.Checked
+        $sndr.Text = if ($sndr.Checked) { "  Pinned (click to unpin)" } else { "  Pin menu (keep open)" }
+        Save-Settings
+    })
+    $menu.Items.Add($miPin) | Out-Null
+
+    $menu.add_ItemClicked({
+        param($sndr,$e)
+        $script:lastMenuClickedName = $e.ClickedItem.Name
+    })
+    $menu.add_Closing({
+        param($sndr,$e)
+        if ($e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked -and $script:lastMenuClickedName -eq "PinMenuItem") {
+            $e.Cancel = $true
+            return
+        }
+        if ($script:menuPinned -and (
+                $e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::AppClicked -or
+                $e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::AppFocusChange)) {
+            $e.Cancel = $true
+        }
+    })
+
     Add-Sep
     if ($stats.Error) {
         Add-Label "  $($stats.Error)"
@@ -856,10 +890,12 @@ function Build-Menu($stats) {
             Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
             Add-Label "  Resets: $rstStr"
             if ($rst) {
-                $sessionStart = $rst.AddHours(-5)
-                $elapsedMin   = ((Get-Date) - $sessionStart).TotalMinutes
-                $remainMin    = ($rst - (Get-Date)).TotalMinutes
-                $rate = if ($elapsedMin -ge 2 -and $pct -gt 0) { $pct / $elapsedMin } else { Get-PreviousSessionRate $sessionStart }
+                $sessionStart    = $rst.AddHours(-5)
+                $elapsedMin      = ((Get-Date) - $sessionStart).TotalMinutes
+                $remainMin       = ($rst - (Get-Date)).TotalMinutes
+                $rateFromCurrent = ($elapsedMin -ge 2 -and $pct -gt 0)
+                $rate = if ($rateFromCurrent) { $pct / $elapsedMin } else { Get-PreviousSessionRate $sessionStart }
+                $isGuess = (-not $rateFromCurrent) -and $rate -and $rate -gt 0
                 if ($rate -and $rate -gt 0 -and $remainMin -gt 0) {
                     $minutesToFull = ([math]::Max(0,100 - $pct)) / $rate
                     if ($minutesToFull -le $remainMin) {
@@ -873,7 +909,8 @@ function Build-Menu($stats) {
                 } else {
                     $paceStr = "--  (insufficient data)"
                 }
-                Add-Label "  On pace: $paceStr"
+                $paceLabel = if ($isGuess) { "Guess (prev. session speed)" } else { "On pace" }
+                Add-Label "  ${paceLabel}: $paceStr"
             }
         }
         Add-Sep
@@ -1098,6 +1135,11 @@ $script:menuObj.Exit.add_Click($script:DoExit)
 $tray.add_MouseClick({
     param($s,$e)
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
+        if ($script:menuObj -and $script:menuObj.Menu.Visible) {
+            # Menu already open (e.g. pinned): right-click again to close it
+            $script:menuObj.Menu.Close()
+            return
+        }
         [Win32.NativeMethods]::SetForegroundWindow($script:hiddenForm.Handle) | Out-Null
         # Ricostruisce menu da cache (nessuna chiamata API)
         $old = $script:menuObj
