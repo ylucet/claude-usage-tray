@@ -2,7 +2,8 @@
 
 A lightweight **Windows system tray monitor** for [Claude Code](https://claude.ai/code) — shows your 5h session quota and 7-day quota at a glance, with a full usage dashboard, all without leaving your desktop.
 
-[![Ko-fi](https://img.shields.io/badge/Buy%20me%20a%20beer-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/edi1986)
+> This is a clone of [edi19863/claude-usage-tray](https://github.com/edi19863/claude-usage-tray) with a few extra features (pinnable menu, configurable refresh rate, account email in the header, and a pace projection for your current session — see below).
+
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4?logo=windows)
 ![PowerShell](https://img.shields.io/badge/requires-PowerShell%205.1-5391FE?logo=powershell)
 ![License](https://img.shields.io/badge/license-MIT-22c55e)
@@ -12,10 +13,13 @@ A lightweight **Windows system tray monitor** for [Claude Code](https://claude.a
 ## Features
 
 - **Color-coded tray icon** that changes based on quota level (green → orange → red → dark red → grey at 100%)
-- **Right-click menu** with instant summary: current %, reset time, extra-usage status
+- **Right-click menu** with instant summary: current %, exact reset time, extra-usage status, and the account email in the header
+- **Pace projection** for the current session — estimates when you'll hit 100% (or how much headroom you'll have left at reset); falls back to a guess based on the previous session's speed when the current one doesn't have enough data yet
+- **Pin the menu** open so it keeps live-updating while you work, instead of closing on click-away
+- **Configurable refresh rate** (1/2/5/10/15/30/60 min), persisted across restarts
 - **Full HTML dashboard** with 4 tabs — Today / This Week / This Month / All Time
 - **Reads your local `~/.claude/projects/*.jsonl` files** directly — no Node.js, no ccusage, no external tools
-- **Calls the Anthropic OAuth API** every 5 minutes for official quota %; falls back to cached values on rate limit
+- **Calls the Anthropic OAuth API** at your configured interval for official quota %; prefers Claude Code's local status-line cache when available (zero extra OAuth calls), and falls back to cached values on rate limit
 - **Desktop notification** at 85% and 90% usage
 
 ## Icon colors
@@ -68,7 +72,7 @@ Quota trend chart (line, with 80%/95% thresholds), range selector (24h / 7d / al
 ### Option C — Git clone
 
 ```
-git clone https://github.com/edi19863/claude-code-usage-tray.git
+git clone https://github.com/ylucet/claude-usage-tray.git
 ```
 
 Then run `start.vbs`.
@@ -92,14 +96,6 @@ Then run `start.vbs`.
 - Token counts come from local files only. No data leaves your machine except the API quota call.
 - If the quota API returns a rate limit (429), the last cached values are used silently.
 - The script uses PowerShell 5.1 and requires UTF-8 BOM encoding. If you edit the `.ps1` file manually, run `add-bom-restart.ps1` afterward.
-
----
-
-## Support
-
-If this tool saves you from hitting the limit mid-session, feel free to buy me a beer.
-
-[![Buy me a beer](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/edi1986)
 
 ---
 
