@@ -791,28 +791,31 @@ function Draw-Bar([double]$pct, [int]$width = 18) {
     return "[" + ("=" * $filled) + (" " * ($width-$filled)) + "]"
 }
 
-# ─── Velocità sessione precedente (fallback quando la sessione corrente non ha ancora dati) ──
-function Get-PreviousSessionRate([datetime]$beforeTime) {
+# ─── Velocità run precedente (fallback quando la finestra corrente non ha ancora dati) ──
+# $field: "sess" o "week" (chiave nella history). $resetDrop: calo che segnala un reset
+# di finestra. $gapMin: buco temporale oltre il quale non ci si fida della continuità.
+function Get-PreviousRate([datetime]$beforeTime, [string]$field, [double]$resetDrop, [double]$gapMin) {
     try {
         if (-not (Test-Path $HistoryFile)) { return $null }
         $raw = Read-JsonFile $HistoryFile
         if (-not $raw) { return $null }
         $pts = @()
         foreach ($h in @($raw)) {
-            if ($null -eq $h.sess) { continue }
+            $v = $h.$field
+            if ($null -eq $v) { continue }
             $dt = Parse-IsoDate $h.ts
             if (-not $dt -or $dt -ge $beforeTime) { continue }
-            $pts += [pscustomobject]@{ dt = $dt; sess = [double]$h.sess }
+            $pts += [pscustomobject]@{ dt = $dt; val = [double]$v }
         }
         $pts = @($pts | Sort-Object dt)
         if ($pts.Count -lt 2) { return $null }
-        # Segmenta in "run" per sessione: una nuova run inizia quando il valore
-        # crolla (reset di finestra) o quando c'e' un buco temporale troppo grande.
+        # Segmenta in "run": una nuova run inizia quando il valore crolla (reset
+        # di finestra) o quando c'e' un buco temporale troppo grande.
         $runs = @(); $cur = @($pts[0])
         for ($i = 1; $i -lt $pts.Count; $i++) {
             $prev = $pts[$i-1]; $p = $pts[$i]
-            $gapMin = ($p.dt - $prev.dt).TotalMinutes
-            if ($p.sess -lt ($prev.sess - 5) -or $gapMin -gt 360) {
+            $gapActual = ($p.dt - $prev.dt).TotalMinutes
+            if ($p.val -lt ($prev.val - $resetDrop) -or $gapActual -gt $gapMin) {
                 $runs += ,$cur
                 $cur = @($p)
             } else {
@@ -825,11 +828,13 @@ function Get-PreviousSessionRate([datetime]$beforeTime) {
         $first = $lastRun[0]; $last = $lastRun[-1]
         $elapsedMin = ($last.dt - $first.dt).TotalMinutes
         if ($elapsedMin -le 0) { return $null }
-        $rate = ($last.sess - $first.sess) / $elapsedMin
+        $rate = ($last.val - $first.val) / $elapsedMin
         if ($rate -le 0) { return $null }
         return $rate
     } catch { return $null }
 }
+function Get-PreviousSessionRate([datetime]$beforeTime) { return Get-PreviousRate $beforeTime "sess" 5 360 }
+function Get-PreviousWeekRate([datetime]$beforeTime)    { return Get-PreviousRate $beforeTime "week" 5 4320 }
 
 # ─── Menu contestuale ─────────────────────────────────────────────────────────
 # $existingMenu: se passato, ripopola quel ContextMenuStrip invece di crearne uno
@@ -933,29 +938,27 @@ function Build-Menu($stats, $existingMenu = $null) {
             Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
             Add-Label "  Resets: $rstStr"
             if ($rst) {
-                # Calculate pace similar to session pace: when will quota be exhausted?
-                $elapsedH    = ([datetime]::Now - $rst.AddDays(-7)).TotalHours
-                $remainingH  = 168 - $elapsedH  # 168 hours in a week
-                if ($pct -lt 100 -and $remainingH -gt 0) {
-                    # Calculate rate of usage (percentage per hour)
-                    $ratePerHour = $pct / $elapsedH
-                    if ($ratePerHour -gt 0) {
-                        $hoursToFull = (100 - $pct) / $ratePerHour
-                        $daysToFull = $hoursToFull / 24
-                        if ($daysToFull -lt 1) {
-                            $hoursToFullRounded = [math]::Round($hoursToFull)
-                            $paceStr = "${hoursToFullRounded}h to 100%"
-                        } else {
-                            $daysToFullRounded = [math]::Round($daysToFull, 1)
-                            $paceStr = "${daysToFullRounded}d to 100%"
-                        }
+                $weekStart       = $rst.AddDays(-7)
+                $elapsedMin      = ((Get-Date) - $weekStart).TotalMinutes
+                $remainMin       = ($rst - (Get-Date)).TotalMinutes
+                $rateFromCurrent = ($elapsedMin -ge 2 -and $pct -gt 0)
+                $rate = if ($rateFromCurrent) { $pct / $elapsedMin } else { Get-PreviousWeekRate $weekStart }
+                $isGuess = (-not $rateFromCurrent) -and $rate -and $rate -gt 0
+                if ($rate -and $rate -gt 0 -and $remainMin -gt 0) {
+                    $minutesToFull = ([math]::Max(0,100 - $pct)) / $rate
+                    if ($minutesToFull -le $remainMin) {
+                        $projTime = (Get-Date).AddMinutes($minutesToFull)
+                        $paceStr  = "100% at " + $projTime.ToString("ddd HH:mm")
                     } else {
-                        $paceStr = "-- (insufficient data)"
+                        $pctAtReset = $pct + $rate * $remainMin
+                        $leftPct    = [math]::Max(0,[math]::Round(100 - $pctAtReset))
+                        $paceStr    = "~${leftPct}% left at reset"
                     }
                 } else {
-                    $paceStr = "100% at reset"
+                    $paceStr = "--  (insufficient data)"
                 }
-                Add-Label "  On pace: $paceStr"
+                $paceLabel = if ($isGuess) { "Guess (prev. week speed)" } else { "On pace" }
+                Add-Label "  ${paceLabel}: $paceStr"
             }
         }
         Add-Sep
