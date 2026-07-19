@@ -933,14 +933,29 @@ function Build-Menu($stats, $existingMenu = $null) {
             Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
             Add-Label "  Resets: $rstStr"
             if ($rst) {
-                $weekStart   = $rst.AddDays(-7)
-                $elapsedH    = ([datetime]::Now - $weekStart).TotalHours
-                $expectedPct = [math]::Round($elapsedH / 168 * 100, 1)
-                $delta       = [math]::Round($pct - $expectedPct, 1)
-                $paceStr     = if ([math]::Abs($delta) -lt 3) { "(on track)" } `
-                               elseif ($delta -gt 0) { "(+${delta}% over)" } `
-                               else { "($delta% under)" }
-                Add-Label "  On pace: ${expectedPct}%  actual: ${pct}%  $paceStr"
+                # Calculate pace similar to session pace: when will quota be exhausted?
+                $elapsedH    = ([datetime]::Now - $rst.AddDays(-7)).TotalHours
+                $remainingH  = 168 - $elapsedH  # 168 hours in a week
+                if ($pct -lt 100 -and $remainingH -gt 0) {
+                    # Calculate rate of usage (percentage per hour)
+                    $ratePerHour = $pct / $elapsedH
+                    if ($ratePerHour -gt 0) {
+                        $hoursToFull = (100 - $pct) / $ratePerHour
+                        $daysToFull = $hoursToFull / 24
+                        if ($daysToFull -lt 1) {
+                            $hoursToFullRounded = [math]::Round($hoursToFull)
+                            $paceStr = "${hoursToFullRounded}h to 100%"
+                        } else {
+                            $daysToFullRounded = [math]::Round($daysToFull, 1)
+                            $paceStr = "${daysToFullRounded}d to 100%"
+                        }
+                    } else {
+                        $paceStr = "-- (insufficient data)"
+                    }
+                } else {
+                    $paceStr = "100% at reset"
+                }
+                Add-Label "  On pace: $paceStr"
             }
         }
         Add-Sep
