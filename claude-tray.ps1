@@ -1,5 +1,17 @@
 ﻿# Claude Code Usage - System Tray Monitor
 
+# --- Istanza singola --------------------------------------------------------
+# Evita icone duplicate quando lo script viene lanciato piu' volte (es. avvio
+# automatico al login + avvio manuale). Il mutex e' di sessione ("Local\"):
+# ogni sessione interattiva ha la sua area di notifica, quindi la sua icona.
+# Il SO rilascia il mutex alla chiusura del processo, anche se viene ucciso.
+$script:singleInstanceCreated = $false
+$script:singleInstanceMutex   = New-Object System.Threading.Mutex($true, "Local\ClaudeUsageTray", [ref]$script:singleInstanceCreated)
+if (-not $script:singleInstanceCreated) {
+    # Un'altra istanza ha gia' l'icona: si esce senza toccare nulla.
+    exit 0
+}
+
 $LogFile = Join-Path $PSScriptRoot "tray-error.log"
 if (Test-Path $LogFile) {
     if ((Get-Item $LogFile).Length -gt 102400) {
@@ -67,6 +79,41 @@ function Get-AccountEmail {
         }
     } catch {}
     return $null
+}
+function Get-AccountPlan {
+    # Il piano di abbonamento e' in ~/.claude/.credentials.json (claudeAiOauth.
+    # subscriptionType: free|pro|max|team|enterprise). Si legge con una regex per
+    # gli stessi motivi di robustezza di Get-AccountEmail. Fallback: il tier di
+    # rate limit in ~/.claude.json (es. "default_claude_max_5x").
+    $plan = $null
+    try {
+        $raw = Get-Content $CredFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($raw -and $raw -match '"subscriptionType"\s*:\s*"([^"]+)"') { $plan = $Matches[1] }
+    } catch {}
+    if (-not $plan) {
+        try {
+            $raw = Get-Content $ClaudeConfigFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            if ($raw -and $raw -match '"(?:organizationRateLimitTier|userRateLimitTier)"\s*:\s*"([^"]+)"') {
+                $tier = $Matches[1]
+                foreach ($k in @('enterprise','team','max','pro','free')) {
+                    if ($tier -match $k) { $plan = $k; break }
+                }
+            }
+        } catch {}
+    }
+    if (-not $plan) { return $null }
+    switch ($plan.ToLower()) {
+        'free'       { return 'Free' }
+        'pro'        { return 'Pro' }
+        'max'        { return 'Max' }
+        'team'       { return 'Team' }
+        'enterprise' { return 'Enterprise' }
+        default      {
+            # Valore sconosciuto: si mostra comunque, con l'iniziale maiuscola.
+            if ($plan.Length -eq 1) { return $plan.ToUpper() }
+            return $plan.Substring(0,1).ToUpper() + $plan.Substring(1)
+        }
+    }
 }
 function Load-Settings {
     $s = $null
@@ -858,7 +905,9 @@ function Build-Menu($stats, $existingMenu = $null) {
     function Add-Sep() { $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null }
 
     $email = Get-AccountEmail
-    $headerText = if ($email) { "  Claude usage: $email" } else { "  Claude usage" }
+    $plan  = Get-AccountPlan
+    $label = if ($plan) { "Claude $plan" } else { "Claude usage" }
+    $headerText = if ($email) { "  ${label}: $email" } else { "  $label" }
     Add-Label $headerText $true
 
     $miPin = New-Object System.Windows.Forms.ToolStripMenuItem
