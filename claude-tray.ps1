@@ -775,6 +775,13 @@ function ConvertFrom-StdinCache($sc, $result) {
     if ($sc.plan)  { $result["Plan"]  = $sc.plan }
     return $result
 }
+function Get-StaleSharedStats($sh, $result) {
+    $result = ConvertFrom-StdinCache $sh $result
+    $result.Error = ""
+    $result["Cached"] = $true
+    $result.LastUpdated = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sh.cached_at).LocalDateTime
+    return $result
+}
 
 # ─── API usage ────────────────────────────────────────────────────────────────
 function Get-UsageStats {
@@ -795,6 +802,14 @@ function Get-UsageStats {
             $script:LastGoodStats = $result
             Save-HistoryEntry $result
             return $result
+        }
+    }
+    # Priorità 1b: file condiviso di un altro account. Il login OAuth di questo
+    # utente Windows darebbe la quota (e l'email) dell'account sbagliato.
+    if (-not $retried) {
+        $sh = Read-CacheFile $SharedUsageFile ([long]::MaxValue)
+        if ($sh -and $sh.email -and $sh.email -ne (Get-AccountEmail)) {
+            return Get-StaleSharedStats $sh $result
         }
     }
     # Priorità 2: cooldown cache OAuth
@@ -855,13 +870,7 @@ function Get-UsageStats {
     # valore condiviso, di qualsiasi eta', invece di un errore.
     if ($result.Error) {
         $sh = Read-CacheFile $SharedUsageFile ([long]::MaxValue)
-        if ($sh) {
-            $result = ConvertFrom-StdinCache $sh $result
-            $result.Error = ""
-            $result["Cached"] = $true
-            $result.LastUpdated = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sh.cached_at).LocalDateTime
-            return $result
-        }
+        if ($sh) { return Get-StaleSharedStats $sh $result }
     }
     if (-not $result.Error) {
         $script:LastGoodStats = $result
