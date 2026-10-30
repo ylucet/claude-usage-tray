@@ -86,6 +86,7 @@ Then run `start.vbs`.
 | `claude-tray.ps1` | Main script — tray icon, menu, dashboard, API polling, JSONL parsing |
 | `start.vbs` | Silent launcher — starts PowerShell without showing a console window |
 | `setup-autostart.bat` | Creates a Windows Startup shortcut for auto-launch at login |
+| `statusline-share.py` | Claude Code status line that shares the quota with a tray running as another Windows user |
 | `add-bom-restart.ps1` | Dev utility — adds UTF-8 BOM to the script and restarts the tray |
 
 ---
@@ -95,7 +96,7 @@ Then run `start.vbs`.
 - **Cost columns are intentionally hidden** — Claude Pro/Max users always have `$0` in their JSONL files.
 - Token counts come from local files only. No data leaves your machine except the API quota call.
 - If the quota API returns a rate limit (429), the last cached values are used silently.
-- **Claude Code running as another Windows user.** The tray cannot read that user's profile, so that user's status-line script shares the quota instead: on each refresh it writes `rate_limits` (plus account email and plan, no secrets) to `<root>\.claude-usage\usage.json`, where `<root>` is the first existing of `D:\AI`, `C:\AI-local`. The tray reads that file (newest of it and its own cache, if under 10 min old), and otherwise shows the last shared value as cached whenever the tray user has no login of its own or is logged in to a different account than the shared one. The writer is the `share_usage` function in that user's `~/.claude/statusline.py`; use an absolute path in its `statusLine` command if that user's `HOME` is not its profile.
+- **Claude Code running as another Windows user.** The tray cannot read that user's profile, so that user's status-line script shares the quota instead: on each refresh it writes `rate_limits` (plus account email and plan, no secrets) to `<root>\.claude-usage\usage.json`, where `<root>` is the first existing of `D:\AI`, `C:\AI-local`. The tray reads that file (newest of it and its own cache, if under 10 min old), and otherwise shows the last shared value as cached whenever the tray user has no login of its own or is logged in to a different account than the shared one. Set that user's `statusLine` command to `statusline-share.py` (absolute path; that user's `HOME` may not be its profile), or copy its `share_usage` function into an existing status-line script.
 - The script uses PowerShell 5.1 and requires UTF-8 BOM encoding. If you edit the `.ps1` file manually, run `add-bom-restart.ps1` afterward.
 
 ---
