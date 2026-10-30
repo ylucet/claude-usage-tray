@@ -34,6 +34,13 @@ $ClientId       = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 $HistoryMaxDays = 30
 $CooldownSec    = 30
 
+# Quota condivisa dalla status line di Claude Code eseguito come altro utente
+# Windows (vedi README). Prima radice esistente; stessa lista della status line.
+$SharedUsageFile = $null
+foreach ($root in @('D:\AI','C:\AI-local')) {
+    if (Test-Path $root) { $SharedUsageFile = Join-Path $root ".claude-usage\usage.json"; break }
+}
+
 $SettingsFile          = Join-Path $env:USERPROFILE ".claude\tray-settings.json"
 $DefaultRefreshMinutes = 5
 $RefreshRatePresets    = @(1,2,5,10,15,30,60)   # minuti
@@ -85,11 +92,11 @@ function Get-AccountPlan {
     # subscriptionType: free|pro|max|team|enterprise). Si legge con una regex per
     # gli stessi motivi di robustezza di Get-AccountEmail. Fallback: il tier di
     # rate limit in ~/.claude.json (es. "default_claude_max_5x").
-    $plan = $null
-    try {
+    param($plan = $null)
+    if (-not $plan) { try {
         $raw = Get-Content $CredFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
         if ($raw -and $raw -match '"subscriptionType"\s*:\s*"([^"]+)"') { $plan = $Matches[1] }
-    } catch {}
+    } catch {} }
     if (-not $plan) {
         try {
             $raw = Get-Content $ClaudeConfigFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
@@ -732,15 +739,41 @@ function Invoke-TokenRefresh([bool]$force = $false) {
 
 # ─── Cache stdin (Claude Code status line) ────────────────────────────────────
 $RateLimitCacheFile = Join-Path $env:USERPROFILE ".claude\rate-limits-cache.json"
-function Get-StdinCache {
-    if (-not (Test-Path $RateLimitCacheFile)) { return $null }
+function Read-CacheFile($path, [long]$maxAgeSec) {
+    if (-not $path -or -not (Test-Path $path)) { return $null }
     try {
-        $c = Read-JsonFile $RateLimitCacheFile
+        $c = Read-JsonFile $path
         if (-not $c -or -not $c.cached_at) { return $null }
-        $nowUnix = [long]([datetime]::UtcNow - [datetime]::new(1970,1,1,0,0,0,'Utc')).TotalSeconds
-        if (($nowUnix - [long]$c.cached_at) -gt 600) { return $null }  # stale oltre 10 min
+        # Non [datetime]::new(1970,1,1,0,0,0,'Utc'): in PS 5.1 'Utc' finisce nei
+        # millisecondi, l'eccezione restituiva sempre $null e la cache non veniva mai usata.
+        $nowUnix = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if (($nowUnix - [long]$c.cached_at) -gt $maxAgeSec) { return $null }
         return $c
     } catch { return $null }
+}
+function Get-StdinCache {
+    # Cache locale e condivisa, entrambe entro 10 min: vince la piu' recente.
+    $local  = Read-CacheFile $RateLimitCacheFile 600
+    $shared = Read-CacheFile $SharedUsageFile 600
+    if ($local -and $shared) {
+        if ([long]$shared.cached_at -gt [long]$local.cached_at) { return $shared } else { return $local }
+    }
+    if ($shared) { return $shared }
+    return $local
+}
+function ConvertFrom-StdinCache($sc, $result) {
+    $result.Session = [ordered]@{
+        Utilization = [math]::Round([double]$sc.five_hour.used_percentage, 1)
+        ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.five_hour.resets_at).LocalDateTime
+    }
+    $result.Week = [ordered]@{
+        Utilization = [math]::Round([double]$sc.seven_day.used_percentage, 1)
+        ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.seven_day.resets_at).LocalDateTime
+    }
+    # Solo il file condiviso porta account e piano dell'altro utente.
+    if ($sc.email) { $result["Email"] = $sc.email }
+    if ($sc.plan)  { $result["Plan"]  = $sc.plan }
+    return $result
 }
 
 # ─── API usage ────────────────────────────────────────────────────────────────
@@ -757,14 +790,7 @@ function Get-UsageStats {
     if (-not $retried) {
         $sc = Get-StdinCache
         if ($sc) {
-            $result.Session = [ordered]@{
-                Utilization = [math]::Round([double]$sc.five_hour.used_percentage, 1)
-                ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.five_hour.resets_at).LocalDateTime
-            }
-            $result.Week = [ordered]@{
-                Utilization = [math]::Round([double]$sc.seven_day.used_percentage, 1)
-                ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.seven_day.resets_at).LocalDateTime
-            }
+            $result = ConvertFrom-StdinCache $sc $result
             $result["Source"] = "live"
             $script:LastGoodStats = $result
             Save-HistoryEntry $result
@@ -782,7 +808,7 @@ function Get-UsageStats {
     $script:LastCallTime = Get-Date
     try {
         $creds = Invoke-TokenRefresh
-        if (-not $creds -or -not $creds.accessToken) { $result.Error = "Nessun token trovato"; return $result }
+        if (-not $creds -or -not $creds.accessToken) { throw "Nessun token trovato" }
         $resp = Invoke-WebRequest `
             -Uri "https://api.anthropic.com/api/oauth/usage" `
             -Method Get `
@@ -823,6 +849,18 @@ function Get-UsageStats {
         }
         $result.Error = if ($msg -match "429") { "Rate limit - dati in cache" } else {
             $s = $msg.Substring(0,[Math]::Min(77,$msg.Length)); if ($msg.Length -gt 77) { $s+'...' } else { $s }
+        }
+    }
+    # Nessun dato OAuth (es. nessun login per questo utente Windows): ultimo
+    # valore condiviso, di qualsiasi eta', invece di un errore.
+    if ($result.Error) {
+        $sh = Read-CacheFile $SharedUsageFile ([long]::MaxValue)
+        if ($sh) {
+            $result = ConvertFrom-StdinCache $sh $result
+            $result.Error = ""
+            $result["Cached"] = $true
+            $result.LastUpdated = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sh.cached_at).LocalDateTime
+            return $result
         }
     }
     if (-not $result.Error) {
@@ -904,8 +942,8 @@ function Build-Menu($stats, $existingMenu = $null) {
     }
     function Add-Sep() { $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null }
 
-    $email = Get-AccountEmail
-    $plan  = Get-AccountPlan
+    $email = if ($stats.Email) { $stats.Email } else { Get-AccountEmail }
+    $plan  = Get-AccountPlan $stats.Plan
     $label = if ($plan) { "Claude $plan" } else { "Claude usage" }
     $headerText = if ($email) { "  ${label}: $email" } else { "  $label" }
     Add-Label $headerText $true
