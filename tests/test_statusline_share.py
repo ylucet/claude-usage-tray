@@ -39,8 +39,13 @@ class ShareUsage(unittest.TestCase):
         with open(os.path.join(self.home, ".claude", ".credentials.json"), "w", encoding="utf-8") as f:
             json.dump({"claudeAiOauth": {"subscriptionType": plan}}, f)
 
-    def share(self, data):
-        sl.share_usage(data, root=self.root, home=self.home)
+    def share(self, data, api=None, now=None):
+        self.fetches = getattr(self, "fetches", 0)
+
+        def fetch(home):
+            self.fetches += 1
+            return api
+        sl.share_usage(data, root=self.root, home=self.home, fetch=fetch, now=now)
 
     def account(self, email):
         path = os.path.join(self.root, ".claude-usage", "accounts", sl.account_file_name(email))
@@ -90,6 +95,75 @@ class ShareUsage(unittest.TestCase):
         self.share(_rl(10, 1000, 40, 9000))
         self.assertIsNone(self.legacy()["email"])
         self.assertFalse(os.path.exists(os.path.join(self.root, ".claude-usage", "accounts")))
+
+    # --- official usage check (Claude Code's rate_limits can lag) ---------
+
+    def test_reported_bug_stale_100_after_reset_replaced_by_official_0(self):
+        # Observed 2026-11-11: after a limit reset, status line still said 100%
+        # (old window ending 1794432000) while the API said 0%, window ending
+        # 1794445200.
+        self.login("b@y.ca")
+        now = 1794427377
+        self.share(_rl(100, 1794432000, 39, 1794697200), now=now, api={
+            "five_hour": {"used_percentage": 0.0, "resets_at": 1794445200},
+            "seven_day": {"used_percentage": 0.0, "resets_at": 1794697200 + 3600}})
+        b = self.account("b@y.ca")
+        self.assertEqual(b["five_hour"]["used_percentage"], 0)
+        self.assertEqual(b["five_hour"]["resets_at"], 1794445200)
+        self.assertEqual(b["seven_day"]["used_percentage"], 0)
+        self.assertEqual(self.legacy()["five_hour"]["used_percentage"], 0)
+
+    def test_window_not_started_beats_stale_window(self):
+        self.login("b@y.ca")
+        now = 10_000_000
+        self.share(_rl(100, now + 3000, 39, now + 90000), now=now, api={
+            "five_hour": {"used_percentage": 0, "resets_at": None},
+            "seven_day": {"used_percentage": 39, "resets_at": now + 90000}})
+        b = self.account("b@y.ca")
+        self.assertEqual(b["five_hour"]["used_percentage"], 0)
+        self.assertEqual(b["seven_day"]["used_percentage"], 39)
+
+    def test_same_window_takes_the_larger_usage(self):
+        self.login("a@x.ca")
+        now = 10_000_000
+        self.share(_rl(42, now + 3000, 10, now + 90000), now=now, api={
+            "five_hour": {"used_percentage": 40, "resets_at": now + 3010},
+            "seven_day": {"used_percentage": 11, "resets_at": now + 90000}})
+        a = self.account("a@x.ca")
+        self.assertEqual(a["five_hour"]["used_percentage"], 42)
+        self.assertEqual(a["seven_day"]["used_percentage"], 11)
+
+    def test_new_window_after_the_last_check_follows_the_status_line(self):
+        self.login("a@x.ca")
+        t0 = 10_000_000
+        self.share(_rl(90, t0 + 100, 10, t0 + 90000), now=t0, api={
+            "five_hour": {"used_percentage": 90, "resets_at": t0 + 100},
+            "seven_day": {"used_percentage": 10, "resets_at": t0 + 90000}})
+        # 200 s later (no new check yet): the old window ended, a new one began.
+        self.share(_rl(2, t0 + 200 + 18000, 11, t0 + 90000), now=t0 + 200, api=None)
+        a = self.account("a@x.ca")
+        self.assertEqual(a["five_hour"]["used_percentage"], 2)
+        self.assertEqual(a["seven_day"]["used_percentage"], 11)
+
+    def test_official_check_at_most_every_five_minutes_per_account(self):
+        self.login("a@x.ca")
+        t0 = 10_000_000
+        api = {"five_hour": {"used_percentage": 1, "resets_at": t0 + 100}}
+        self.share(_rl(1, t0 + 100, 1, t0 + 90000), now=t0, api=api)
+        self.share(_rl(1, t0 + 100, 1, t0 + 90000), now=t0 + sl.API_EVERY - 1, api=api)
+        self.assertEqual(self.fetches, 1)
+        self.share(_rl(1, t0 + 100, 1, t0 + 90000), now=t0 + sl.API_EVERY, api=api)
+        self.assertEqual(self.fetches, 2)
+
+    def test_failed_check_falls_back_to_status_line(self):
+        self.login("a@x.ca")
+        self.share(_rl(33, 10_000_100, 20, 10_090_000), now=10_000_000, api=None)
+        self.assertEqual(self.account("a@x.ca")["five_hour"]["used_percentage"], 33)
+
+    def test_fetch_without_token_returns_none_without_network(self):
+        # setUp's credentials hold no accessToken.
+        self.login("a@x.ca")
+        self.assertIsNone(sl.fetch_usage(self.home))
 
     def test_file_name_is_case_insensitive_and_path_safe(self):
         self.assertEqual(sl.account_file_name("Yves.Lucet@UBC.ca"), "yves.lucet@ubc.ca.json")
