@@ -40,6 +40,9 @@ $SharedUsageFile = $null
 foreach ($root in @('D:\AI','C:\AI-local')) {
     if (Test-Path $root) { $SharedUsageFile = Join-Path $root ".claude-usage\usage.json"; break }
 }
+# Un file per account (accounts\<email>.json): Claude Code passa da un account
+# all'altro con /login e l'account lasciato conserva l'ultima quota nota.
+$SharedAccountsDir = if ($SharedUsageFile) { Join-Path (Split-Path $SharedUsageFile) "accounts" } else { $null }
 
 $SettingsFile          = Join-Path $env:USERPROFILE ".claude\tray-settings.json"
 $DefaultRefreshMinutes = 5
@@ -226,8 +229,14 @@ function Save-HistoryEntry($stats) {
         if (Test-Path $HistoryFile) { $loaded = Read-JsonFile $HistoryFile; if ($loaded) { $history = @($loaded) } }
         $cutoff  = (Get-Date).AddDays(-$HistoryMaxDays)
         $history = @($history | Where-Object { $d = Parse-IsoDate $_.ts; $d -and $d -gt $cutoff })
+        # ts = istante del dato (non del polling): lo stesso snapshot condiviso
+        # letto a due refresh consecutivi non viene registrato due volte.
+        $ts    = if ($stats.LastUpdated) { ([datetime]$stats.LastUpdated).ToString("o") } else { (Get-Date).ToString("o") }
+        $email = if ($stats.Email) { "$($stats.Email)" } else { $null }
+        if (@($history | Where-Object { $_.ts -eq $ts -and "$($_.email)" -eq "$email" }).Count) { return }
         $history += [ordered]@{
-            ts   = (Get-Date).ToString("o")
+            ts    = $ts
+            email = $email
             sess = if ($null -ne $stats.Session.Utilization) { $stats.Session.Utilization } else { $null }
             week = if ($null -ne $stats.Week.Utilization)    { $stats.Week.Utilization }    else { $null }
         }
@@ -240,8 +249,12 @@ function Show-HistoryChart {
   try {
     $history = @()
     if (Test-Path $HistoryFile) { $loaded = Read-JsonFile $HistoryFile; if ($loaded) { $history = @($loaded) } }
+    # Solo l'account della scheda selezionata (le voci senza email sono precedenti
+    # alla gestione di piu' account).
+    $acctEmail = "$($script:stats.Email)"
+    if ($acctEmail) { $history = @($history | Where-Object { -not $_.email -or $_.email -eq $acctEmail }) }
 
-    $jsRows = ($history | ForEach-Object {
+    $jsRows =($history | ForEach-Object {
         $ts = if ($_.ts -match '^\d{4}-\d{2}-\d{2}T[\d:+.\-Z]+$') { $_.ts } else { '' }
         $s  = if ("$($_.sess)" -match '^\d+(\.\d+)?$') { $_.sess } else { 'null' }
         $w  = if ("$($_.week)" -match '^\d+(\.\d+)?$') { $_.week } else { 'null' }
@@ -751,79 +764,97 @@ function Read-CacheFile($path, [long]$maxAgeSec) {
         return $c
     } catch { return $null }
 }
-function Get-StdinCache {
-    # Cache locale e condivisa, entrambe entro 10 min: vince la piu' recente.
-    $local  = Read-CacheFile $RateLimitCacheFile 600
-    $shared = Read-CacheFile $SharedUsageFile 600
-    if ($local -and $shared) {
-        if ([long]$shared.cached_at -gt [long]$local.cached_at) { return $shared } else { return $local }
+
+# ─── Account condivisi (status line di Claude Code, altro utente Windows) ─────
+# Ultimo snapshot per account: i file accounts\*.json piu' usage.json (scritto
+# anche dalle status line precedenti). Per ogni email vince il piu' recente.
+function Get-SharedSnapshots {
+    $byEmail = [ordered]@{}   # chiavi case-insensitive
+    $files = @()
+    if ($SharedAccountsDir -and (Test-Path $SharedAccountsDir)) {
+        $files += @(Get-ChildItem $SharedAccountsDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Extension -eq '.json' } | ForEach-Object { $_.FullName })
     }
-    if ($shared) { return $shared }
-    return $local
-}
-function ConvertFrom-StdinCache($sc, $result) {
-    $result.Session = [ordered]@{
-        Utilization = [math]::Round([double]$sc.five_hour.used_percentage, 1)
-        ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.five_hour.resets_at).LocalDateTime
+    if ($SharedUsageFile) { $files += $SharedUsageFile }
+    foreach ($f in $files) {
+        $c = Read-CacheFile $f ([long]::MaxValue)
+        if (-not $c -or -not $c.email) { continue }
+        $prev = $byEmail[$c.email]
+        if (-not $prev -or [long]$c.cached_at -gt [long]$prev.cached_at) { $byEmail[$c.email] = $c }
     }
-    $result.Week = [ordered]@{
-        Utilization = [math]::Round([double]$sc.seven_day.used_percentage, 1)
-        ResetsAt    = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sc.seven_day.resets_at).LocalDateTime
-    }
-    # Solo il file condiviso porta account e piano dell'altro utente.
-    if ($sc.email) { $result["Email"] = $sc.email }
-    if ($sc.plan)  { $result["Plan"]  = $sc.plan }
-    return $result
-}
-function Get-StaleSharedStats($sh, $result) {
-    $result = ConvertFrom-StdinCache $sh $result
-    $result.Error = ""
-    $result["Cached"] = $true
-    $result.LastUpdated = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$sh.cached_at).LocalDateTime
-    return $result
+    return $byEmail
 }
 
-# ─── API usage ────────────────────────────────────────────────────────────────
-function Get-UsageStats {
+# Snapshot (formato status line) -> statistiche del menu. Piu' vecchio di
+# $freshSec = "Cached". Una finestra il cui reset e' gia' passato e' ripartita
+# da 0 (salvo uso fuori da Claude Code, che la status line non vede).
+function ConvertFrom-Snapshot($sc, [long]$freshSec = 600) {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $r = [ordered]@{
+        Session     = [ordered]@{}
+        Week        = [ordered]@{}
+        ExtraUsage  = $null          # la status line non lo riporta
+        Error       = ""
+        Email       = $sc.email
+        Plan        = $sc.plan
+        LastUpdated = [DateTimeOffset]::FromUnixTimeSeconds([long]$sc.cached_at).LocalDateTime
+    }
+    foreach ($p in @(@('five_hour','Session'), @('seven_day','Week'))) {
+        $w = $sc.($p[0])
+        if (-not $w) { continue }
+        $rs = [long]$w.resets_at
+        if ($rs -gt 0 -and $rs -le $now) {
+            $r[$p[1]] = [ordered]@{ Utilization = 0.0; ResetsAt = $null; ResetSince = $true }
+        } else {
+            $r[$p[1]] = [ordered]@{
+                Utilization = [math]::Round([double]$w.used_percentage, 1)
+                ResetsAt    = if ($rs -gt 0) { [DateTimeOffset]::FromUnixTimeSeconds($rs).LocalDateTime } else { $null }
+            }
+        }
+    }
+    if (($now - [long]$sc.cached_at) -gt $freshSec) { $r["Cached"] = $true } else { $r["Source"] = "live" }
+    return $r
+}
+
+function Copy-AsCached($s) {
+    $c = [ordered]@{}
+    foreach ($k in $s.Keys) { if ($k -ne "Source") { $c[$k] = $s[$k] } }
+    $c["Cached"] = $true
+    return $c
+}
+
+# ─── Login proprio (utente Windows del tray) ──────────────────────────────────
+function Get-OwnLoginStats {
     param([bool]$retried = $false)
     $result = [ordered]@{
         Session     = [ordered]@{}
         Week        = [ordered]@{}
         ExtraUsage  = $false
         Error       = ""
+        Email       = Get-AccountEmail
+        Plan        = $null
         LastUpdated = (Get-Date)
     }
-    # Priorità 1: cache stdin da Claude Code (zero OAuth calls)
+    # Priorità 1: cache stdin della status line di questo utente (zero OAuth calls)
     if (-not $retried) {
-        $sc = Get-StdinCache
+        $sc = Read-CacheFile $RateLimitCacheFile 600
         if ($sc) {
-            $result = ConvertFrom-StdinCache $sc $result
-            $result["Source"] = "live"
-            $script:LastGoodStats = $result
-            Save-HistoryEntry $result
-            return $result
-        }
-    }
-    # Priorità 1b: file condiviso di un altro account. Il login OAuth di questo
-    # utente Windows darebbe la quota (e l'email) dell'account sbagliato.
-    if (-not $retried) {
-        $sh = Read-CacheFile $SharedUsageFile ([long]::MaxValue)
-        if ($sh -and $sh.email -and $sh.email -ne (Get-AccountEmail)) {
-            return Get-StaleSharedStats $sh $result
+            $r = ConvertFrom-Snapshot $sc
+            if (-not $r.Email) { $r.Email = $result.Email }
+            $script:LastGoodStats = $r
+            return $r
         }
     }
     # Priorità 2: cooldown cache OAuth
     $elapsed = ((Get-Date) - $script:LastCallTime).TotalSeconds
     if (-not $retried -and $elapsed -lt $CooldownSec -and $script:LastGoodStats) {
-        $cached = [ordered]@{}
-        foreach ($k in $script:LastGoodStats.Keys) { $cached[$k] = $script:LastGoodStats[$k] }
-        $cached["Cached"] = $true; $cached["LastUpdated"] = Get-Date
-        return $cached
+        return Copy-AsCached $script:LastGoodStats
     }
     $script:LastCallTime = Get-Date
     try {
         $creds = Invoke-TokenRefresh
         if (-not $creds -or -not $creds.accessToken) { throw "Nessun token trovato" }
+        $result.Plan = $creds.subscriptionType
         $resp = Invoke-WebRequest `
             -Uri "https://api.anthropic.com/api/oauth/usage" `
             -Method Get `
@@ -853,30 +884,110 @@ function Get-UsageStats {
         $msg = $_.Exception.Message
         if ($msg -match "401" -and -not $retried) {
             $nc = Invoke-TokenRefresh -force $true
-            if ($nc) { return Get-UsageStats -retried $true }
+            if ($nc) { return Get-OwnLoginStats -retried $true }
         }
         # Rate limit o qualsiasi errore: restituisce cache se disponibile
-        if ($script:LastGoodStats) {
-            $cached = [ordered]@{}
-            foreach ($k in $script:LastGoodStats.Keys) { $cached[$k] = $script:LastGoodStats[$k] }
-            $cached["Cached"] = $true; $cached["LastUpdated"] = Get-Date
-            return $cached
-        }
+        if ($script:LastGoodStats) { return Copy-AsCached $script:LastGoodStats }
         $result.Error = if ($msg -match "429") { "Rate limit - dati in cache" } else {
             $s = $msg.Substring(0,[Math]::Min(77,$msg.Length)); if ($msg.Length -gt 77) { $s+'...' } else { $s }
         }
     }
-    # Nessun dato OAuth (es. nessun login per questo utente Windows): ultimo
-    # valore condiviso, di qualsiasi eta', invece di un errore.
-    if ($result.Error) {
-        $sh = Read-CacheFile $SharedUsageFile ([long]::MaxValue)
-        if ($sh) { return Get-StaleSharedStats $sh $result }
-    }
     if (-not $result.Error) {
+        $result["Source"] = "live"
         $script:LastGoodStats = $result
-        Save-HistoryEntry $result
     }
     return $result
+}
+
+# ─── Tutti gli account ────────────────────────────────────────────────────────
+# Accounts: email -> statistiche, in ordine alfabetico (schede stabili).
+# Active: l'account in uso da Claude Code = snapshot condiviso piu' recente;
+# senza file condivisi, il login proprio. L'icona mostra l'account attivo.
+function Get-AllAccountStats {
+    $acc    = [ordered]@{}
+    $active = $null
+    $newest = [long]-1
+    $snaps  = Get-SharedSnapshots
+    foreach ($e in @($snaps.Keys)) {
+        $acc[$e] = ConvertFrom-Snapshot $snaps[$e]
+        if ([long]$snaps[$e].cached_at -gt $newest) { $newest = [long]$snaps[$e].cached_at; $active = $e }
+    }
+    # Login proprio: solo se il suo account non ha gia' un dato condiviso fresco.
+    $own = $null
+    if (Test-Path $CredFile) {
+        $ownEmail = Get-AccountEmail
+        $sh = if ($ownEmail) { $acc[$ownEmail] } else { $null }
+        if (-not ($sh -and $sh.Source -eq 'live')) {
+            $own = Get-OwnLoginStats
+            if ($own -and -not $own.Error) {
+                $key = if ($own.Email) { "$($own.Email)" } else { "(this Windows user)" }
+                if (-not $sh -or $own.LastUpdated -gt $sh.LastUpdated) { $acc[$key] = $own }
+                if (-not $active) { $active = $key }
+            }
+        }
+    }
+    $sorted = [ordered]@{}
+    foreach ($k in @($acc.Keys | Sort-Object)) { $sorted[$k] = $acc[$k] }
+    if ($sorted.Count -eq 0) {
+        $sorted[""] = if ($own) { $own } else {
+            [ordered]@{ Session=[ordered]@{}; Week=[ordered]@{}; ExtraUsage=$null
+                        Error="No Claude login or shared quota found"; LastUpdated=(Get-Date) }
+        }
+        $active = ""
+    }
+    return [pscustomobject]@{ Accounts = $sorted; Active = $active }
+}
+
+function Save-AllHistory($accounts) {
+    foreach ($e in @($accounts.Keys)) {
+        $s = $accounts[$e]
+        if ($e -and $s.Source -eq 'live') { Save-HistoryEntry $s }
+    }
+}
+
+# Legge tutti gli account; $script:stats = account della scheda selezionata
+# (usato dalla dashboard), di default quello in uso.
+function Update-Accounts {
+    $r = Get-AllAccountStats
+    $script:accounts    = $r.Accounts
+    $script:activeEmail = $r.Active
+    $sel = if ($script:selectedEmail -and $script:accounts.Contains($script:selectedEmail)) { $script:selectedEmail } else { $script:activeEmail }
+    $script:stats = $script:accounts[$sel]
+    Save-AllHistory $script:accounts
+}
+
+function Format-Pct($v) { if ($null -ne $v) { "{0:0}%" -f [double]$v } else { "?" } }
+
+# Tooltip: NotifyIcon.Text in .NET Framework accetta al massimo 63 caratteri.
+function Get-TrayTooltip($accounts, [string]$active, [bool]$isPeak) {
+    $peak = if ($isPeak) { "PEAK" } else { "off-peak" }
+    $s = $accounts[$active]
+    if ($accounts.Count -le 1) {
+        $text = if ($s.Error) { "Claude - $($s.Error)" } else {
+            "Claude  Sess:$(Format-Pct $s.Session.Utilization) | Week:$(Format-Pct $s.Week.Utilization) | $peak"
+        }
+    } else {
+        $parts = foreach ($e in @($accounts.Keys)) {
+            $a = $accounts[$e]
+            $mark = if ($e -eq $active) { [string][char]0x25CF } else { "" }
+            "$mark$(($e -split '@')[0]) $(Format-Pct $a.Session.Utilization)/$(Format-Pct $a.Week.Utilization)"
+        }
+        $text = ($parts -join " | ") + " | $peak"
+    }
+    return $text.Substring(0, [Math]::Min(63, $text.Length))
+}
+
+function Get-BalloonText($accounts, [string]$active) {
+    $lines = foreach ($e in @($accounts.Keys)) {
+        $st = $accounts[$e]
+        $who = if ($accounts.Count -gt 1) { if ($e -eq $active) { "$e (in use)`n" } else { "$e`n" } } else { "" }
+        if ($st.Error) { "$who$($st.Error)" } else {
+            $sr = if ($st.Session.ResetSince) { "reset" } elseif ($st.Session.ResetsAt) { $st.Session.ResetsAt.ToString("HH:mm") } else { "?" }
+            $wr = if ($st.Week.ResetSince) { "reset" } elseif ($st.Week.ResetsAt) { $st.Week.ResetsAt.ToString("ddd dd/MM HH:mm") } else { "?" }
+            "${who}Session: $(Format-Pct $st.Session.Utilization)   [resets $sr]`nWeekly: $(Format-Pct $st.Week.Utilization)   [resets $wr]"
+        }
+    }
+    return ($lines -join "`n")
 }
 
 # ─── Barra testo ──────────────────────────────────────────────────────────────
@@ -888,7 +999,7 @@ function Draw-Bar([double]$pct, [int]$width = 18) {
 # ─── Velocità run precedente (fallback quando la finestra corrente non ha ancora dati) ──
 # $field: "sess" o "week" (chiave nella history). $resetDrop: calo che segnala un reset
 # di finestra. $gapMin: buco temporale oltre il quale non ci si fida della continuità.
-function Get-PreviousRate([datetime]$beforeTime, [string]$field, [double]$resetDrop, [double]$gapMin) {
+function Get-PreviousRate([datetime]$beforeTime, [string]$field, [double]$resetDrop, [double]$gapMin, [string]$email = "") {
     try {
         if (-not (Test-Path $HistoryFile)) { return $null }
         $raw = Read-JsonFile $HistoryFile
@@ -897,6 +1008,8 @@ function Get-PreviousRate([datetime]$beforeTime, [string]$field, [double]$resetD
         foreach ($h in @($raw)) {
             $v = $h.$field
             if ($null -eq $v) { continue }
+            # Solo l'account richiesto; le voci senza email precedono i piu' account.
+            if ($email -and $h.email -and $h.email -ne $email) { continue }
             $dt = Parse-IsoDate $h.ts
             if (-not $dt -or $dt -ge $beforeTime) { continue }
             $pts += [pscustomobject]@{ dt = $dt; val = [double]$v }
@@ -927,13 +1040,34 @@ function Get-PreviousRate([datetime]$beforeTime, [string]$field, [double]$resetD
         return $rate
     } catch { return $null }
 }
-function Get-PreviousSessionRate([datetime]$beforeTime) { return Get-PreviousRate $beforeTime "sess" 5 360 }
-function Get-PreviousWeekRate([datetime]$beforeTime)    { return Get-PreviousRate $beforeTime "week" 5 4320 }
+function Get-PreviousSessionRate([datetime]$beforeTime, [string]$email = "") { return Get-PreviousRate $beforeTime "sess" 5 360 $email }
+function Get-PreviousWeekRate([datetime]$beforeTime, [string]$email = "")    { return Get-PreviousRate $beforeTime "week" 5 4320 $email }
 
 # ─── Menu contestuale ─────────────────────────────────────────────────────────
+function Format-Ago([datetime]$t) {
+    $m = [math]::Round(((Get-Date) - $t).TotalMinutes)
+    if ($m -lt 1)    { return "just now" }
+    if ($m -lt 60)   { return "${m} min ago" }
+    if ($m -lt 1440) { return "$([math]::Floor($m/60))h $($m%60)min ago" }
+    return "$([math]::Floor($m/1440))d $([math]::Floor(($m%1440)/60))h ago"
+}
+
+# Mostra solo le voci dell'account $email (Tag "acct:<email>"); le voci comuni
+# non hanno Tag. Available, non Visible: vale anche a menu chiuso.
+function Set-MenuTab($menu, [string]$email) {
+    $menu.SuspendLayout()
+    foreach ($it in $menu.Items) {
+        $t = "$($it.Tag)"
+        if ($t.StartsWith("acct:")) { $it.Available = ($t -eq "acct:$email") }
+    }
+    $menu.ResumeLayout()
+}
+
+# $accounts: email -> statistiche (Get-AllAccountStats). Con piu' account, una
+# scheda per account in cima al menu; $active (in uso da Claude Code) ha il pallino.
 # $existingMenu: se passato, ripopola quel ContextMenuStrip invece di crearne uno
 # nuovo (usato per aggiornare i dati mentre il menu e' aperto/pinnato).
-function Build-Menu($stats, $existingMenu = $null) {
+function Build-Menu($accounts, [string]$active, $existingMenu = $null) {
     $isNewMenu = ($null -eq $existingMenu)
     if ($isNewMenu) {
         $menu = New-Object System.Windows.Forms.ContextMenuStrip
@@ -951,11 +1085,37 @@ function Build-Menu($stats, $existingMenu = $null) {
     }
     function Add-Sep() { $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null }
 
-    $email = if ($stats.Email) { $stats.Email } else { Get-AccountEmail }
-    $plan  = Get-AccountPlan $stats.Plan
-    $label = if ($plan) { "Claude $plan" } else { "Claude usage" }
-    $headerText = if ($email) { "  ${label}: $email" } else { "  $label" }
-    Add-Label $headerText $true
+    $emails = @($accounts.Keys)
+    $multi  = ($emails.Count -gt 1)
+    $sel    = if ($script:selectedEmail -and $accounts.Contains($script:selectedEmail)) { $script:selectedEmail } else { $active }
+
+    if ($multi) {
+        $tabs = New-Object System.Windows.Forms.TabControl
+        $tabFont = New-Object System.Drawing.Font("Segoe UI",9)
+        $tabs.Font = $tabFont
+        $tabW = 16
+        foreach ($e in $emails) {
+            $tp = New-Object System.Windows.Forms.TabPage
+            $tp.Name = $e
+            $tp.Text = if ($e -eq $active) { [string][char]0x25CF + " $e" } else { $e }
+            $tabs.TabPages.Add($tp)
+            $tabW += [System.Windows.Forms.TextRenderer]::MeasureText($tp.Text, $tabFont).Width + 12
+        }
+        $tabs.SelectedIndex = [math]::Max(0, [array]::IndexOf($emails, $sel))
+        $tabs.add_SelectedIndexChanged({
+            param($sndr,$e)
+            $script:selectedEmail = $sndr.SelectedTab.Name
+            if ($script:accounts) { $script:stats = $script:accounts[$script:selectedEmail] }
+            $owner = if ($sndr.Parent -is [System.Windows.Forms.ToolStrip]) { $sndr.Parent } else { $script:menuObj.Menu }
+            Set-MenuTab $owner $script:selectedEmail
+        })
+        $tabHost = New-Object System.Windows.Forms.ToolStripControlHost($tabs)
+        $tabHost.Name     = "TabsHost"
+        $tabHost.AutoSize = $false
+        # Altezza = sola fila delle linguette: le pagine restano vuote.
+        $tabHost.Size     = New-Object System.Drawing.Size([math]::Max(300, $tabW), 24)
+        $menu.Items.Add($tabHost) | Out-Null
+    }
 
     $miPin = New-Object System.Windows.Forms.ToolStripMenuItem
     $miPin.Name = "PinMenuItem"
@@ -977,7 +1137,8 @@ function Build-Menu($stats, $existingMenu = $null) {
         })
         $menu.add_Closing({
             param($sndr,$e)
-            if ($e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked -and $script:lastMenuClickedName -eq "PinMenuItem") {
+            if ($e.CloseReason -eq [System.Windows.Forms.ToolStripDropDownCloseReason]::ItemClicked -and
+                $script:lastMenuClickedName -in @("PinMenuItem","TabsHost")) {
                 $e.Cancel = $true
                 return
             }
@@ -989,106 +1150,131 @@ function Build-Menu($stats, $existingMenu = $null) {
         })
     }
 
-    Add-Sep
-    if ($stats.Error) {
-        Add-Label "  $($stats.Error)"
-    } else {
-        if ($null -ne $stats.Session.Utilization) {
-            $pct = $stats.Session.Utilization; $rst = $stats.Session.ResetsAt
-            $mins = if ($rst) { [math]::Round(($rst-(Get-Date)).TotalMinutes) } else { 0 }
-            $relPart = if ($mins -le 0) { "now" } elseif ($mins -lt 60) { "in ${mins}min" } else { "in $([math]::Floor($mins/60))h $($mins%60)min" }
-            $rstStr = if (-not $rst) { "?" } else { $rst.ToString("ddd HH:mm") + "  ($relPart)" }
-            Add-Label "  Current session (5h)" $true
-            Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
-            Add-Label "  Resets: $rstStr"
-            if ($rst) {
-                $sessionStart    = $rst.AddHours(-5)
-                $elapsedMin      = ((Get-Date) - $sessionStart).TotalMinutes
-                $remainMin       = ($rst - (Get-Date)).TotalMinutes
-                $rateFromCurrent = ($elapsedMin -ge 2 -and $pct -gt 0)
-                $rate = if ($rateFromCurrent) { $pct / $elapsedMin } else { Get-PreviousSessionRate $sessionStart }
-                $isGuess = (-not $rateFromCurrent) -and $rate -and $rate -gt 0
-                if ($rate -and $rate -gt 0 -and $remainMin -gt 0) {
-                    $minutesToFull = ([math]::Max(0,100 - $pct)) / $rate
-                    if ($minutesToFull -le $remainMin) {
-                        $projTime = (Get-Date).AddMinutes($minutesToFull)
-                        $paceStr  = "100% at " + $projTime.ToString("HH:mm")
-                    } else {
-                        $pctAtReset = $pct + $rate * $remainMin
-                        $leftPct    = [math]::Max(0,[math]::Round(100 - $pctAtReset))
-                        $paceStr    = "~${leftPct}% left at reset"
-                    }
-                } else {
-                    $paceStr = "--  (insufficient data)"
-                }
-                $paceLabel = if ($isGuess) { "Guess (prev. session speed)" } else { "On pace" }
-                Add-Label "  ${paceLabel}: $paceStr"
-            }
-        }
+    $ownEmail = Get-AccountEmail
+    foreach ($acctEmail in $emails) {
+        $start = $menu.Items.Count
+        $stats = $accounts[$acctEmail]
+        $isActive = ($acctEmail -eq $active)
         Add-Sep
-        if ($null -ne $stats.Week.Utilization) {
-            $pct = $stats.Week.Utilization; $rst = $stats.Week.ResetsAt
-            $daysLeft = if ($rst) { [math]::Round(($rst-(Get-Date)).TotalDays,1) } else { 0 }
-            $rstStr = if ($rst) { $rst.ToString("ddd MM/dd  HH:mm") + "  (in $daysLeft d)" } else { "?" }
-            Add-Label "  Current week (7d)" $true
-            Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
-            Add-Label "  Resets: $rstStr"
-            if ($rst) {
-                $weekStart       = $rst.AddDays(-7)
-                $elapsedMin      = ((Get-Date) - $weekStart).TotalMinutes
-                $remainMin       = ($rst - (Get-Date)).TotalMinutes
-                $rateFromCurrent = ($elapsedMin -ge 2 -and $pct -gt 0)
-                $rate = if ($rateFromCurrent) { $pct / $elapsedMin } else { Get-PreviousWeekRate $weekStart }
-                $isGuess = (-not $rateFromCurrent) -and $rate -and $rate -gt 0
-                if ($rate -and $rate -gt 0 -and $remainMin -gt 0) {
-                    $minutesToFull = ([math]::Max(0,100 - $pct)) / $rate
-                    if ($minutesToFull -le $remainMin) {
-                        $projTime = (Get-Date).AddMinutes($minutesToFull)
-                        $paceStr  = "100% at " + $projTime.ToString("ddd HH:mm")
-                    } else {
-                        $pctAtReset = $pct + $rate * $remainMin
-                        $leftPct    = [math]::Max(0,[math]::Round(100 - $pctAtReset))
-                        $paceStr    = "~${leftPct}% left at reset"
-                    }
-                } else {
-                    $paceStr = "--  (insufficient data)"
-                }
-                $paceLabel = if ($isGuess) { "Guess (prev. week speed)" } else { "On pace" }
-                Add-Label "  ${paceLabel}: $paceStr"
-            }
+        # Piano: dal dato stesso; dai file locali solo se e' il login di questo utente.
+        $plan = if ($stats.Plan) { Get-AccountPlan $stats.Plan } elseif ($acctEmail -and $acctEmail -eq $ownEmail) { Get-AccountPlan } else { $null }
+        $label = if ($plan) { "Claude $plan" } else { "Claude usage" }
+        $headerText = if ($acctEmail) { "  ${label}: $acctEmail" } else { "  $label" }
+        Add-Label $headerText $true
+        if ($multi) {
+            if ($isActive) { Add-Label "  In use by Claude Code" }
+            else           { Add-Label ("  Not in use - last seen {0}" -f (Format-Ago $stats.LastUpdated)) }
         }
+        # Proiezione: non per un account fermo, i cui valori sono vecchi.
+        $showPace = $isActive -or -not $stats.Cached
+
         Add-Sep
-        $euText   = if ($stats.ExtraUsage) { "  Extra usage: ENABLED" } else { "  Extra usage: disabled" }
-        Add-Label $euText
-        $ptNow    = Get-PacificTime
-        $dow      = [int]$ptNow.DayOfWeek
-        $isPeakM  = ($dow -ge 1 -and $dow -le 5 -and $ptNow.Hour -ge 5 -and $ptNow.Hour -lt 11)
-        if ($isPeakM) {
-            # ends today at 11:00 PT
-            $endPT    = $ptNow.Date.AddHours(11)
-            $minLeft  = [math]::Round(($endPT - $ptNow).TotalMinutes)
-            $timeStr  = if ($minLeft -ge 60) { "$([math]::Floor($minLeft/60))h $($minLeft % 60)min" } else { "${minLeft}min" }
-            $peakText = "  Peak hours: ACTIVE  (ends in $timeStr)"
+        if ($stats.Error) {
+            Add-Label "  $($stats.Error)"
         } else {
-            # find next Mon-Fri 05:00 PT
-            $next = $ptNow.Date.AddHours(5)
-            if ($ptNow.Hour -ge 11) { $next = $next.AddDays(1) }
-            for ($i = 0; $i -lt 7; $i++) {
-                $d = [int]$next.DayOfWeek
-                if ($d -ge 1 -and $d -le 5) { break }
-                $next = $next.AddDays(1)
+            if ($null -ne $stats.Session.Utilization) {
+                $pct = $stats.Session.Utilization; $rst = $stats.Session.ResetsAt
+                $mins = if ($rst) { [math]::Round(($rst-(Get-Date)).TotalMinutes) } else { 0 }
+                $relPart = if ($mins -le 0) { "now" } elseif ($mins -lt 60) { "in ${mins}min" } else { "in $([math]::Floor($mins/60))h $($mins%60)min" }
+                $rstStr = if ($stats.Session.ResetSince) { "reset since last seen" } elseif (-not $rst) { "?" } else { $rst.ToString("ddd HH:mm") + "  ($relPart)" }
+                Add-Label "  Current session (5h)" $true
+                Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
+                Add-Label "  Resets: $rstStr"
+                if ($rst -and $showPace) {
+                    $sessionStart    = $rst.AddHours(-5)
+                    $elapsedMin      = ((Get-Date) - $sessionStart).TotalMinutes
+                    $remainMin       = ($rst - (Get-Date)).TotalMinutes
+                    $rateFromCurrent = ($elapsedMin -ge 2 -and $pct -gt 0)
+                    $rate = if ($rateFromCurrent) { $pct / $elapsedMin } else { Get-PreviousSessionRate $sessionStart $acctEmail }
+                    $isGuess = (-not $rateFromCurrent) -and $rate -and $rate -gt 0
+                    if ($rate -and $rate -gt 0 -and $remainMin -gt 0) {
+                        $minutesToFull = ([math]::Max(0,100 - $pct)) / $rate
+                        if ($minutesToFull -le $remainMin) {
+                            $projTime = (Get-Date).AddMinutes($minutesToFull)
+                            $paceStr  = "100% at " + $projTime.ToString("HH:mm")
+                        } else {
+                            $pctAtReset = $pct + $rate * $remainMin
+                            $leftPct    = [math]::Max(0,[math]::Round(100 - $pctAtReset))
+                            $paceStr    = "~${leftPct}% left at reset"
+                        }
+                    } else {
+                        $paceStr = "--  (insufficient data)"
+                    }
+                    $paceLabel = if ($isGuess) { "Guess (prev. session speed)" } else { "On pace" }
+                    Add-Label "  ${paceLabel}: $paceStr"
+                }
             }
-            $minLeft  = [math]::Round(($next - $ptNow).TotalMinutes)
-            $timeStr  = if ($minLeft -ge 1440) { "$([math]::Floor($minLeft/1440))d $([math]::Floor(($minLeft%1440)/60))h" } `
-                        elseif ($minLeft -ge 60) { "$([math]::Floor($minLeft/60))h $($minLeft % 60)min" } `
-                        else { "${minLeft}min" }
-            $peakText = "  Peak hours: off  (starts in $timeStr)"
+            Add-Sep
+            if ($null -ne $stats.Week.Utilization) {
+                $pct = $stats.Week.Utilization; $rst = $stats.Week.ResetsAt
+                $daysLeft = if ($rst) { [math]::Round(($rst-(Get-Date)).TotalDays,1) } else { 0 }
+                $rstStr = if ($stats.Week.ResetSince) { "reset since last seen" } elseif ($rst) { $rst.ToString("ddd MM/dd  HH:mm") + "  (in $daysLeft d)" } else { "?" }
+                Add-Label "  Current week (7d)" $true
+                Add-Label ("  {0}  {1,5:N1}%" -f (Draw-Bar $pct), $pct)
+                Add-Label "  Resets: $rstStr"
+                if ($rst -and $showPace) {
+                    $weekStart       = $rst.AddDays(-7)
+                    $elapsedMin      = ((Get-Date) - $weekStart).TotalMinutes
+                    $remainMin       = ($rst - (Get-Date)).TotalMinutes
+                    $rateFromCurrent = ($elapsedMin -ge 2 -and $pct -gt 0)
+                    $rate = if ($rateFromCurrent) { $pct / $elapsedMin } else { Get-PreviousWeekRate $weekStart $acctEmail }
+                    $isGuess = (-not $rateFromCurrent) -and $rate -and $rate -gt 0
+                    if ($rate -and $rate -gt 0 -and $remainMin -gt 0) {
+                        $minutesToFull = ([math]::Max(0,100 - $pct)) / $rate
+                        if ($minutesToFull -le $remainMin) {
+                            $projTime = (Get-Date).AddMinutes($minutesToFull)
+                            $paceStr  = "100% at " + $projTime.ToString("ddd HH:mm")
+                        } else {
+                            $pctAtReset = $pct + $rate * $remainMin
+                            $leftPct    = [math]::Max(0,[math]::Round(100 - $pctAtReset))
+                            $paceStr    = "~${leftPct}% left at reset"
+                        }
+                    } else {
+                        $paceStr = "--  (insufficient data)"
+                    }
+                    $paceLabel = if ($isGuess) { "Guess (prev. week speed)" } else { "On pace" }
+                    Add-Label "  ${paceLabel}: $paceStr"
+                }
+            }
+            if ($null -ne $stats.ExtraUsage) {
+                Add-Sep
+                $euText = if ($stats.ExtraUsage) { "  Extra usage: ENABLED" } else { "  Extra usage: disabled" }
+                Add-Label $euText
+            }
         }
-        Add-Label $peakText
+        Add-Sep
+        $cacheNote = if ($stats.Cached) { " (cached)" } else { "" }
+        $updFmt = if ($stats.LastUpdated -and ([datetime]$stats.LastUpdated).Date -ne (Get-Date).Date) { "{0:ddd MM/dd HH:mm}" } else { "{0:HH:mm:ss}" }
+        Add-Label ("  Updated: $updFmt{1}" -f $stats.LastUpdated, $cacheNote)
+        for ($i = $start; $i -lt $menu.Items.Count; $i++) { $menu.Items[$i].Tag = "acct:$acctEmail" }
     }
+
     Add-Sep
-    $cacheNote = if ($stats.Cached) { " (cached)" } else { "" }
-    Add-Label ("  Updated: {0:HH:mm:ss}{1}" -f $stats.LastUpdated, $cacheNote)
+    $ptNow    = Get-PacificTime
+    $dow      = [int]$ptNow.DayOfWeek
+    $isPeakM  = ($dow -ge 1 -and $dow -le 5 -and $ptNow.Hour -ge 5 -and $ptNow.Hour -lt 11)
+    if ($isPeakM) {
+        # ends today at 11:00 PT
+        $endPT    = $ptNow.Date.AddHours(11)
+        $minLeft  = [math]::Round(($endPT - $ptNow).TotalMinutes)
+        $timeStr  = if ($minLeft -ge 60) { "$([math]::Floor($minLeft/60))h $($minLeft % 60)min" } else { "${minLeft}min" }
+        $peakText = "  Peak hours: ACTIVE  (ends in $timeStr)"
+    } else {
+        # find next Mon-Fri 05:00 PT
+        $next = $ptNow.Date.AddHours(5)
+        if ($ptNow.Hour -ge 11) { $next = $next.AddDays(1) }
+        for ($i = 0; $i -lt 7; $i++) {
+            $d = [int]$next.DayOfWeek
+            if ($d -ge 1 -and $d -le 5) { break }
+            $next = $next.AddDays(1)
+        }
+        $minLeft  = [math]::Round(($next - $ptNow).TotalMinutes)
+        $timeStr  = if ($minLeft -ge 1440) { "$([math]::Floor($minLeft/1440))d $([math]::Floor(($minLeft%1440)/60))h" } `
+                    elseif ($minLeft -ge 60) { "$([math]::Floor($minLeft/60))h $($minLeft % 60)min" } `
+                    else { "${minLeft}min" }
+        $peakText = "  Peak hours: off  (starts in $timeStr)"
+    }
+    Add-Label $peakText
     Add-Sep
     $miHistory = New-Object System.Windows.Forms.ToolStripMenuItem; $miHistory.Text = "  Usage history..."
     $menu.Items.Add($miHistory) | Out-Null
@@ -1113,6 +1299,7 @@ function Build-Menu($stats, $existingMenu = $null) {
     $menu.Items.Add($miRate) | Out-Null
     $miExit = New-Object System.Windows.Forms.ToolStripMenuItem; $miExit.Text = "  Exit"
     $menu.Items.Add($miExit) | Out-Null
+    Set-MenuTab $menu $sel
     if (-not $isNewMenu) { $menu.ResumeLayout() }
     return [pscustomobject]@{ Menu=$menu; History=$miHistory; Refresh=$miRefresh; Exit=$miExit }
 }
@@ -1173,24 +1360,15 @@ $script:hiddenForm.StartPosition = [System.Windows.Forms.FormStartPosition]::Man
 $script:hiddenForm.Location = New-Object System.Drawing.Point(-32000,-32000)
 $script:hiddenForm.Show(); $script:hiddenForm.Hide()
 
-$script:stats   = Get-UsageStats
-$script:menuObj = Build-Menu $script:stats
+Update-Accounts
+$script:menuObj = Build-Menu $script:accounts $script:activeEmail
 
+# Icona, avvisi e file evento seguono l'account in uso da Claude Code.
 function Update-Tray {
-    $s = $script:stats
-    if ($s.Error) {
-        $text = "Claude Code - $($s.Error)"
-        $tray.Text = $text.Substring(0,[Math]::Min(127,$text.Length))
-        return
-    }
-    $sp  = if ($null -ne $s.Session.Utilization) { "$($s.Session.Utilization)%" } else { "?" }
-    $wp  = if ($null -ne $s.Week.Utilization)    { "$($s.Week.Utilization)%" }    else { "?" }
-    $upd = if ($s.LastUpdated) { $s.LastUpdated.ToString("dd/MM HH:mm") } else { "mai" }
-    $isPeak    = Get-IsPeakHour
-    $peakTag   = if ($isPeak) { " | PEAK" } else { " | off-peak" }
-    $sourceTag = if ($s.Source -eq "live") { " [live]" } else { "" }
-    $text = "Claude  Sess:$sp | Week:$wp$peakTag$sourceTag | $upd"
-    $tray.Text = $text.Substring(0,[Math]::Min(127,$text.Length))
+    $s = $script:accounts[$script:activeEmail]
+    $isPeak = Get-IsPeakHour
+    $tray.Text = Get-TrayTooltip $script:accounts $script:activeEmail $isPeak
+    if ($s.Error) { return }
 
     $sPct   = if ($null -ne $s.Session.Utilization) { [double]$s.Session.Utilization } else { 0.0 }
     $wPct   = if ($null -ne $s.Week.Utilization)    { [double]$s.Week.Utilization }    else { 0.0 }
@@ -1218,6 +1396,8 @@ function Update-Tray {
     }
     # Session event file — per trigger agenti esterni
     $curResetsAt = if ($s.Session.ResetsAt) { $s.Session.ResetsAt.ToString("o") } else { "" }
+    # Cambio di account (/login) non e' un reset: confronta solo lo stesso account.
+    if ($script:activeEmail -ne $script:lastSessEmail) { $script:lastSessResetsAt = ""; $script:lastSessEmail = $script:activeEmail }
     if ($curResetsAt -and $script:lastSessResetsAt -and $curResetsAt -ne $script:lastSessResetsAt) {
         # ResetsAt cambiato = nuova sessione 5h iniziata
         try {
@@ -1240,12 +1420,12 @@ $script:DoShowHistory = { Show-HistoryChart }
 # DoRefresh: aggiorna dati API e icona (chiamato da timer e "Aggiorna ora")
 $script:DoRefresh = {
     try {
-        $script:stats = Get-UsageStats
+        Update-Accounts
         Update-Tray
         # Se il menu e' aperto (es. pinnato), ripopola i suoi contenuti sul posto
         # cosi' i dati mostrati non restano bloccati al momento dell'apertura.
         if ($script:menuObj -and $script:menuObj.Menu.Visible) {
-            $script:menuObj = Build-Menu $script:stats $script:menuObj.Menu
+            $script:menuObj = Build-Menu $script:accounts $script:activeEmail $script:menuObj.Menu
             $script:menuObj.History.add_Click($script:DoShowHistory)
             $script:menuObj.Refresh.add_Click($script:DoRefresh)
             $script:menuObj.Exit.add_Click($script:DoExit)
@@ -1277,7 +1457,10 @@ $tray.add_MouseClick({
         [Win32.NativeMethods]::SetForegroundWindow($script:hiddenForm.Handle) | Out-Null
         # Ricostruisce menu da cache (nessuna chiamata API)
         $old = $script:menuObj
-        $script:menuObj = Build-Menu $script:stats
+        # Ogni apertura parte dalla scheda dell'account in uso.
+        $script:selectedEmail = $null
+        $script:stats = $script:accounts[$script:activeEmail]
+        $script:menuObj = Build-Menu $script:accounts $script:activeEmail
         $script:menuObj.History.add_Click($script:DoShowHistory)
         $script:menuObj.Refresh.add_Click($script:DoRefresh)
         $script:menuObj.Exit.add_Click($script:DoExit)
@@ -1286,14 +1469,7 @@ $tray.add_MouseClick({
         $pos = $script:hiddenForm.PointToClient([System.Windows.Forms.Cursor]::Position)
         $script:menuObj.Menu.Show($script:hiddenForm, $pos)
     } elseif ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-        $st = $script:stats
-        $msg = if ($st.Error) { $st.Error } else {
-            $sp = if ($null -ne $st.Session.Utilization) { "$($st.Session.Utilization)%" } else { "?" }
-            $wp = if ($null -ne $st.Week.Utilization)    { "$($st.Week.Utilization)%" }    else { "?" }
-            $sr = if ($st.Session.ResetsAt) { $st.Session.ResetsAt.ToString("HH:mm") } else { "?" }
-            $wr = if ($st.Week.ResetsAt)    { $st.Week.ResetsAt.ToString("ddd dd/MM HH:mm") } else { "?" }
-            "Session: $sp   [resets $sr]`nWeekly: $wp   [resets $wr]"
-        }
+        $msg = Get-BalloonText $script:accounts $script:activeEmail
         $s.ShowBalloonTip(5000,"Claude Code /usage",$msg,[System.Windows.Forms.ToolTipIcon]::Info)
     }
 })
