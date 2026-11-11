@@ -3,14 +3,21 @@
 
 Use it when Claude Code runs as a different Windows user than the tray: the
 tray cannot read that user's profile, so this script writes the status line's
-rate_limits (plus account email and plan, no secrets) to
-<root>\\.claude-usage\\usage.json, root = first existing of SHARED_ROOTS (keep
-in sync with claude-tray.ps1). In that user's ~/.claude/settings.json:
+rate_limits (plus account email and plan, no secrets) under
+<root>\\.claude-usage\\, root = first existing of SHARED_ROOTS (keep in sync
+with claude-tray.ps1):
+
+    accounts\\<email>.json   one file per account, so an account you switched
+                            away from (/login) keeps its last known quota
+    usage.json              the account in use (read by older trays)
+
+In that user's ~/.claude/settings.json:
 
     "statusLine": {"type": "command", "command": "python C:/path/to/statusline-share.py"}
 
 Use an absolute path: that user's HOME may not be its profile. To keep your own
-status line, copy share_usage() into it and call it with the parsed stdin.
+status line, copy share_usage() and its helpers into it and call it with the
+parsed stdin.
 """
 import json
 import os
@@ -32,14 +39,32 @@ def _grab(path, key):
         return None
 
 
-def share_usage(data):
+def _write(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)  # atomic: the tray never sees a half-written file
+
+
+def _resets(snap):
+    try:
+        return (snap["five_hour"]["resets_at"], snap["seven_day"]["resets_at"])
+    except (KeyError, TypeError):
+        return None
+
+
+def account_file_name(email):
+    return re.sub(r"[^A-Za-z0-9@._+-]", "_", email.lower()) + ".json"
+
+
+def share_usage(data, root=None, home=None):
     rl = data.get("rate_limits") or {}
     if not rl.get("five_hour") and not rl.get("seven_day"):
         return
-    root = next((r for r in SHARED_ROOTS if os.path.isdir(r)), None)
+    root = root or next((r for r in SHARED_ROOTS if os.path.isdir(r)), None)
     if not root:
         return
-    home = os.path.expanduser("~")
+    home = home or os.path.expanduser("~")
     out = {
         "cached_at": int(time.time()),
         "five_hour": rl.get("five_hour"),
@@ -48,12 +73,28 @@ def share_usage(data):
         "plan": _grab(os.path.join(home, ".claude", ".credentials.json"), "subscriptionType"),
     }
     folder = os.path.join(root, ".claude-usage")
+    if out["email"]:
+        accounts = os.path.join(folder, "accounts")
+        os.makedirs(accounts, exist_ok=True)
+        mine = account_file_name(out["email"])
+        # Right after /login the status line may still carry the previous
+        # account's limits. Both reset instants equal to another account's
+        # means they are that account's limits: write nothing.
+        key = _resets(out)
+        if key:
+            for name in os.listdir(accounts):
+                if name == mine or not name.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(accounts, name), encoding="utf-8") as f:
+                        other = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                if _resets(other) == key:
+                    return
+        _write(os.path.join(accounts, mine), out)
     os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, "usage.json")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(out, f)
-    os.replace(tmp, path)  # atomic: the tray never sees a half-written file
+    _write(os.path.join(folder, "usage.json"), out)
 
 
 if __name__ == "__main__":
