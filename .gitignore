@@ -14,3 +14,5 @@ CLAUDE.md
 .claudeignore
 .claude/
 installa-avvio-automatico.bat
+
+__pycache__/
